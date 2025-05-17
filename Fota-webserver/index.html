@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 FOTA Management</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .info-box {
+            background-color: #e0f7fa;
+            border-left: 5px solid #00b8d4;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+        }
+        .status-box {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            padding: 15px;
+            background-color: #f1f8e9;
+            border-radius: 4px;
+            border-left: 5px solid #7cb342;
+        }
+        .table-container {
+            margin-top: 20px;
+            overflow-x: auto;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 20px;
+        }
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        tr:hover {
+            background-color: #f5f5f5;
+        }
+        .upload-section {
+            background-color: #fff8e1;
+            padding: 20px;
+            border-radius: 4px;
+            margin-top: 30px;
+            border-left: 5px solid #ffb300;
+        }
+        .btn {
+            display: inline-block;
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 15px;
+            text-align: center;
+            text-decoration: none;
+            border-radius: 4px;
+            cursor: pointer;
+            border: none;
+        }
+        .btn:hover {
+            background-color: #45a049;
+        }
+        .btn-red {
+            background-color: #f44336;
+        }
+        .btn-red:hover {
+            background-color: #d32f2f;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"], input[type="file"] {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        .flex-end {
+            display: flex;
+            justify-content: flex-end;
+        }
+        .small-text {
+            font-size: 12px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ESP32 FOTA Management</h1>
+        
+        <div class="info-box">
+            <h2>Server Informasi</h2>
+            <p>Server ini digunakan untuk menyediakan firmware updates untuk perangkat ESP32 melalui koneksi GPRS (SIM800L).</p>
+            <p>Endpoints:</p>
+            <ul>
+                <li><code>/api/firmware/latest</code> - Mendapatkan informasi firmware terbaru</li>
+                <li><code>/api/firmware/list</code> - Melihat daftar firmware yang tersedia</li>
+                <li><code>/firmware/[filename]</code> - Mengunduh firmware</li>
+            </ul>
+        </div>
+        
+        <div class="status-box">
+            <div>
+                <h3>Status Server</h3>
+                <p id="server-status">Mengecek status...</p>
+            </div>
+            <div>
+                <h3>Waktu Server</h3>
+                <p id="server-time">-</p>
+            </div>
+        </div>
+        
+        <h2>Firmware Terbaru</h2>
+        <div id="latest-firmware">
+            Loading...
+        </div>
+        
+        <h2>Daftar Firmware Tersedia</h2>
+        <div class="table-container">
+            <table id="firmware-table">
+                <thead>
+                    <tr>
+                        <th>Nama</th>
+                        <th>Versi</th>
+                        <th>Ukuran</th>
+                        <th>Tanggal</th>
+                        <th>MD5</th>
+                        <th>Aksi</th>
+                    </tr>
+                </thead>
+                <tbody id="firmware-list">
+                    <tr>
+                        <td colspan="6">Loading...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="upload-section">
+            <h2>Upload Firmware Baru</h2>
+            <form id="upload-form">
+                <div class="form-group">
+                    <label for="version">Versi Firmware:</label>
+                    <input type="text" id="version" name="version" placeholder="1.0.0" required>
+                    <p class="small-text">Format versi: x.y.z (misalnya 1.0.1)</p>
+                </div>
+                <div class="form-group">
+                    <label for="firmware">File Firmware:</label>
+                    <input type="file" id="firmware" name="firmware" accept=".bin" required>
+                    <p class="small-text">File .bin hasil build dari PlatformIO</p>
+                </div>
+                <div class="flex-end">
+                    <button type="submit" class="btn">Upload Firmware</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // Fungsi untuk format ukuran file
+        function formatBytes(bytes, decimals = 2) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const dm = decimals < 0 ? 0 : decimals;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+        }
+
+        // Fungsi untuk format tanggal
+        function formatDate(dateString) {
+            const date = new Date(dateString);
+            return date.toLocaleString();
+        }
+
+        // Mengecek status server
+        async function checkServerStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                document.getElementById('server-status').textContent = 'Online';
+                document.getElementById('server-time').textContent = formatDate(data.timestamp);
+                
+                // Refresh status setiap 30 detik
+                setTimeout(checkServerStatus, 30000);
+            } catch (error) {
+                document.getElementById('server-status').textContent = 'Offline';
+                console.error('Error checking server status:', error);
+                
+                // Coba lagi setelah 10 detik jika error
+                setTimeout(checkServerStatus, 10000);
+            }
+        }
+
+        // Mendapatkan firmware terbaru
+        async function getLatestFirmware() {
+            try {
+                const response = await fetch('/api/firmware/latest');
+                
+                if (!response.ok) {
+                    document.getElementById('latest-firmware').innerHTML = '<p>Tidak ada firmware tersedia</p>';
+                    return;
+                }
+                
+                const data = await response.json();
+                
+                let html = `
+                    <div class="info-box">
+                        <h3>${data.name}</h3>
+                        <p><strong>Versi:</strong> ${data.version}</p>
+                        <p><strong>Ukuran:</strong> ${formatBytes(data.size)}</p>
+                        <p><strong>MD5:</strong> ${data.md5}</p>
+                        <p><a href="${data.file}" class="btn" download>Download</a></p>
+                    </div>
+                `;
+                
+                document.getElementById('latest-firmware').innerHTML = html;
+            } catch (error) {
+                document.getElementById('latest-firmware').innerHTML = '<p>Error mendapatkan informasi firmware</p>';
+                console.error('Error getting latest firmware:', error);
+            }
+        }
+
+        // Mendapatkan daftar firmware
+        async function getFirmwareList() {
+            try {
+                const response = await fetch('/api/firmware/list');
+                
+                if (!response.ok) {
+                    document.getElementById('firmware-list').innerHTML = '<tr><td colspan="6">Tidak ada firmware tersedia</td></tr>';
+                    return;
+                }
+                
+                const data = await response.json();
+                
+                if (data.length === 0) {
+                    document.getElementById('firmware-list').innerHTML = '<tr><td colspan="6">Tidak ada firmware tersedia</td></tr>';
+                    return;
+                }
+                
+                let html = '';
+                data.forEach(firmware => {
+                    html += `
+                        <tr>
+                            <td>${firmware.name}</td>
+                            <td>${firmware.version}</td>
+                            <td>${formatBytes(firmware.size)}</td>
+                            <td>${formatDate(firmware.date)}</td>
+                            <td>${firmware.md5}</td>
+                            <td>
+                                <a href="/firmware/${firmware.name}" class="btn" download>Download</a>
+                            </td>
+                        </tr>
+                    `;
+                });
+                
+                document.getElementById('firmware-list').innerHTML = html;
+            } catch (error) {
+                document.getElementById('firmware-list').innerHTML = '<tr><td colspan="6">Error mendapatkan daftar firmware</td></tr>';
+                console.error('Error getting firmware list:', error);
+            }
+        }
+
+        // Upload firmware baru
+        document.getElementById('upload-form').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const versionInput = document.getElementById('version');
+            const firmwareInput = document.getElementById('firmware');
+            
+            if (!versionInput.value || !firmwareInput.files[0]) {
+                alert('Mohon isi semua field');
+                return;
+            }
+            
+            // Validasi format versi
+            const versionRegex = /^\d+\.\d+\.\d+$/;
+            if (!versionRegex.test(versionInput.value)) {
+                alert('Format versi harus x.y.z (misalnya 1.0.1)');
+                return;
+            }
+            
+            // Validasi file
+            const file = firmwareInput.files[0];
+            if (!file.name.endsWith('.bin')) {
+                alert('File harus berformat .bin');
+                return;
+            }
+            
+            try {
+                const formData = new FormData();
+                formData.append('version', versionInput.value);
+                formData.append('firmware', file);
+                
+                // Upload firmware
+                const response = await fetch(`/api/firmware/upload?version=${versionInput.value}`, {
+                    method: 'POST',
+                    body: file
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    alert(`Firmware berhasil diupload: ${data.fileName}`);
+                    
+                    // Refresh data
+                    getLatestFirmware();
+                    getFirmwareList();
+                    
+                    // Reset form
+                    document.getElementById('upload-form').reset();
+                } else {
+                    alert('Gagal mengupload firmware: ' + data.error);
+                }
+            } catch (error) {
+                alert('Error mengupload firmware');
+                console.error('Error uploading firmware:', error);
+            }
+        });
+
+        // Inisialisasi
+        checkServerStatus();
+        getLatestFirmware();
+        getFirmwareList();
+    </script>
+</body>
+</html>
