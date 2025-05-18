@@ -32,13 +32,15 @@ npm install
 5. Buat NGINX config
 ```
 sudo apt install nginx
-sudo nano /etc/nginx/sites-available/ota
+sudo nano /etc/nginx/sites-available/default
 ```
 NGINX Config
 ```
 server {
-    listen 80;
-    server_name your-domain.com; # External IP VM
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    server_name _;
 
     location / {
         proxy_pass http://localhost:3000;

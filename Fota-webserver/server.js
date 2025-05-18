@@ -177,11 +177,6 @@ function sendFirmwareChunk(deviceId, offset, size) {
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Dashboard admin
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
-});
-
 // API untuk upload firmware
 app.post('/api/firmware/upload', express.raw({ type: 'application/octet-stream', limit: '8mb' }), (req, res) => {
   try {
@@ -236,6 +231,65 @@ app.get('/api/firmware/list', (req, res) => {
     res.json(files);
   } catch (error) {
     console.error('Error listing firmware:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Api Status Checker
+app.get('/api/status', (req, res) => {
+  res.json({ status: 'running', timestamp: new Date().toISOString() });
+});
+
+// Informasi tentang firmware terbaru
+app.get('/api/firmware/latest', (req, res) => {
+  try {
+    // Cari file firmware terbaru di folder
+    const files = fs.readdirSync(FIRMWARE_DIR);
+    if (files.length === 0) {
+      return res.status(404).json({ error: 'Tidak ada firmware tersedia' });
+    }
+
+    // Urutkan file berdasarkan waktu modifikasi (terbaru ke lama)
+    const sortedFiles = files
+      .filter(file => file.endsWith('.bin'))
+      .map(file => {
+        const filePath = path.join(FIRMWARE_DIR, file);
+        const stats = fs.statSync(filePath);
+        return {
+          name: file,
+          path: filePath,
+          size: stats.size,
+          mtime: stats.mtime
+        };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+
+    if (sortedFiles.length === 0) {
+      return res.status(404).json({ error: 'Tidak ada firmware tersedia' });
+    }
+
+    // Ambil file terbaru
+    const latestFirmware = sortedFiles[0];
+    
+    // Ekstrak versi dari nama file
+    const versionMatch = latestFirmware.name.match(/_v(\d+\.\d+\.\d+)\.bin$/);
+    const version = versionMatch ? versionMatch[1] : '1.0.0';
+    
+    // Hitung MD5 hash
+    const fileBuffer = fs.readFileSync(latestFirmware.path);
+    const md5Hash = crypto.createHash('md5').update(fileBuffer).digest('hex');
+    
+    const firmwareInfo = {
+      version: version,
+      name: latestFirmware.name,
+      file: `firmware/${latestFirmware.name}`,
+      size: latestFirmware.size,
+      md5: md5Hash
+    };
+    
+    res.json(firmwareInfo);
+  } catch (error) {
+    console.error('Error accessing firmware:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
