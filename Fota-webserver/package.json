@@ -11,9 +11,11 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "aedes": "^0.51.3",
     "express": "^5.1.0",
     "fs": "^0.0.1-security",
     "https": "^1.0.0",
+    "mqtt": "^5.13.0",
     "path": "^0.12.7"
   }
 }

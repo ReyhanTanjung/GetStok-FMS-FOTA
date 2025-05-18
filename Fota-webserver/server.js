@@ -1,38 +1,82 @@
 // server.js
 const express = require('express');
-const https = require('https');
+const mqtt = require('mqtt');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const app = express();
 const PORT = 3000;
+const MQTT_PORT = 1883;
+const MQTT_BROKER = 'mqtt://localhost';
+
+// Import modul MQTT broker
+const aedes = require('aedes')();
+const net = require('net');
 
 // Folder untuk menyimpan firmware
 const FIRMWARE_DIR = path.join(__dirname, 'firmware');
+const CHUNK_SIZE = 1024; // Default chunk size
 
 // Pastikan direktori firmware ada
 if (!fs.existsSync(FIRMWARE_DIR)) {
   fs.mkdirSync(FIRMWARE_DIR);
 }
 
-// Middleware untuk logging
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
-  next();
+// Mulai MQTT Broker
+const mqttServer = net.createServer(aedes.handle);
+mqttServer.listen(MQTT_PORT, () => {
+  console.log(`MQTT broker berjalan di port ${MQTT_PORT}`);
 });
 
-// Rute statis untuk file firmware
-app.use('/firmware', express.static(FIRMWARE_DIR));
+// Connect ke MQTT broker
+const mqttClient = mqtt.connect(MQTT_BROKER);
 
-// Informasi tentang firmware terbaru
-app.get('/api/firmware/latest', (req, res) => {
+mqttClient.on('connect', () => {
+  console.log('Server terhubung ke MQTT broker');
+  mqttClient.subscribe('device/firmware/request');
+});
+
+// Handle permintaan firmware dari device
+mqttClient.on('message', (topic, message) => {
+  if (topic === 'device/firmware/request') {
+    handleFirmwareRequest(message);
+  }
+});
+
+// Fungsi untuk menangani permintaan firmware
+function handleFirmwareRequest(message) {
   try {
-    // Cari file firmware terbaru di folder
+    const request = JSON.parse(message.toString());
+    const deviceId = request.device;
+    const action = request.action;
+    const currentVersion = request.version;
+    
+    console.log(`Permintaan firmware dari ${deviceId}, aksi: ${action}`);
+    
+    if (action === 'check') {
+      // Kirim informasi firmware terbaru
+      sendLatestFirmwareInfo(deviceId);
+    } else if (action === 'download') {
+      // Kirim chunk firmware
+      const offset = request.offset;
+      const size = request.size || CHUNK_SIZE;
+      sendFirmwareChunk(deviceId, offset, size);
+    }
+  } catch (error) {
+    console.error('Error handling firmware request:', error);
+  }
+}
+
+// Fungsi untuk mengirim informasi firmware terbaru
+function sendLatestFirmwareInfo(deviceId) {
+  try {
+    // Cari file firmware terbaru
     const files = fs.readdirSync(FIRMWARE_DIR);
     if (files.length === 0) {
-      return res.status(404).json({ error: 'Tidak ada firmware tersedia' });
+      console.log('Tidak ada firmware tersedia');
+      return;
     }
-
+    
     // Urutkan file berdasarkan waktu modifikasi (terbaru ke lama)
     const sortedFiles = files
       .filter(file => file.endsWith('.bin'))
@@ -47,11 +91,12 @@ app.get('/api/firmware/latest', (req, res) => {
         };
       })
       .sort((a, b) => b.mtime - a.mtime);
-
+    
     if (sortedFiles.length === 0) {
-      return res.status(404).json({ error: 'Tidak ada firmware tersedia' });
+      console.log('Tidak ada firmware tersedia');
+      return;
     }
-
+    
     // Ambil file terbaru
     const latestFirmware = sortedFiles[0];
     
@@ -66,19 +111,78 @@ app.get('/api/firmware/latest', (req, res) => {
     const firmwareInfo = {
       version: version,
       name: latestFirmware.name,
-      file: `firmware/${latestFirmware.name}`,
       size: latestFirmware.size,
       md5: md5Hash
     };
     
-    res.json(firmwareInfo);
+    console.log(`Mengirim info firmware ke ${deviceId}: v${version}, size: ${latestFirmware.size}`);
+    mqttClient.publish(`device/firmware/info`, JSON.stringify(firmwareInfo));
   } catch (error) {
-    console.error('Error accessing firmware:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Error sending firmware info:', error);
   }
+}
+
+// Fungsi untuk mengirim chunk firmware
+function sendFirmwareChunk(deviceId, offset, size) {
+  try {
+    // Cari file firmware terbaru
+    const files = fs.readdirSync(FIRMWARE_DIR)
+      .filter(file => file.endsWith('.bin'))
+      .map(file => {
+        const filePath = path.join(FIRMWARE_DIR, file);
+        const stats = fs.statSync(filePath);
+        return { name: file, path: filePath, size: stats.size, mtime: stats.mtime };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    
+    if (files.length === 0) {
+      console.log('Tidak ada firmware tersedia untuk chunk');
+      return;
+    }
+    
+    const firmware = files[0];
+    const fileBuffer = fs.readFileSync(firmware.path);
+    
+    // Validasi offset dan size
+    if (offset >= fileBuffer.length) {
+      console.log(`Offset tidak valid: ${offset}, ukuran file: ${fileBuffer.length}`);
+      return;
+    }
+    
+    // Batasi size chunk
+    const chunkSize = Math.min(size, fileBuffer.length - offset);
+    const chunk = fileBuffer.slice(offset, offset + chunkSize);
+    
+    // Buat header JSON
+    const header = JSON.stringify({
+      offset: offset,
+      size: chunkSize,
+      total: fileBuffer.length
+    });
+    
+    // Gabungkan header dan data binari dengan separator newline
+    const message = Buffer.concat([
+      Buffer.from(header + '\n'),
+      chunk
+    ]);
+    
+    console.log(`Mengirim chunk: offset=${offset}, size=${chunkSize}, total=${fileBuffer.length}`);
+    mqttClient.publish(`device/firmware/data`, message);
+  } catch (error) {
+    console.error('Error sending firmware chunk:', error);
+  }
+}
+
+// HTTP Server untuk upload dan manajemen firmware
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Dashboard admin
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// Upload firmware baru
+// API untuk upload firmware
 app.post('/api/firmware/upload', express.raw({ type: 'application/octet-stream', limit: '8mb' }), (req, res) => {
   try {
     // Dapatkan versi dari query parameter
@@ -104,7 +208,7 @@ app.post('/api/firmware/upload', express.raw({ type: 'application/octet-stream',
   }
 });
 
-// Daftar firmware yang tersedia
+// API untuk daftar firmware
 app.get('/api/firmware/list', (req, res) => {
   try {
     const files = fs.readdirSync(FIRMWARE_DIR)
@@ -136,34 +240,7 @@ app.get('/api/firmware/list', (req, res) => {
   }
 });
 
-// Tampilkan halaman dashboard sederhana
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+// Mulai HTTP server
+app.listen(PORT, () => {
+  console.log(`HTTP server berjalan di port ${PORT}`);
 });
-
-// Cek status server
-app.get('/api/status', (req, res) => {
-  res.json({ status: 'running', timestamp: new Date().toISOString() });
-});
-
-// Mulai server HTTPS
-let server;
-try {
-  const sslOptions = {
-    key: fs.readFileSync('localhost+2-key.pem'),
-    cert: fs.readFileSync('localhost+2.pem')
-  };
-  
-  server = https.createServer(sslOptions, app).listen(PORT, () => {
-    console.log(`Server OTA berjalan di port ${PORT}`);
-    console.log(`Buka https://localhost:${PORT} untuk dashboard`);
-  });
-} catch (error) {
-  console.error('Error starting HTTPS server:', error);
-  console.log('Falling back to HTTP server...');
-  
-  server = app.listen(PORT, () => {
-    console.log(`Server OTA (HTTP) berjalan di port ${PORT}`);
-    console.log(`Buka http://localhost:${PORT} untuk dashboard`);
-  });
-}

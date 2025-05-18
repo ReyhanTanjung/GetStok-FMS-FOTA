@@ -6,6 +6,7 @@
 ```
 sudo apt install git -y
 sudo apt install nodejs -y
+sudo apt install npm -y
 ```
 
 2. Create key to access git repo
@@ -15,7 +16,7 @@ ls ~/.ssh
 ssh-keygen -t rsa -b 4096 -C "emailmu@example.com"
 ```
 
-enter the generated key to the github repo
+enter the generated key `cat ~/.ssh/id_rsa.pub` to the github repo 
 
 3. Clone Repository
 ```
@@ -49,3 +50,10 @@ server {
     }
 }
 ```
+start nging with `sudo systemctl start nginx` and reload config with `sudo systemctl reload nginx`, to check `sudo nginx -t`
+
+6. Run node application with
+```
+pm2 start server.js --name ota-server
+```
+use pm2 delete to remove pm2 session
