@@ -77,6 +77,7 @@
             border-radius: 4px;
             cursor: pointer;
             border: none;
+            margin-right: 5px;
         }
         .btn:hover {
             background-color: #45a049;
@@ -109,6 +110,37 @@
         .small-text {
             font-size: 12px;
             color: #666;
+        }
+        .action-buttons {
+            white-space: nowrap;
+        }
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: rgba(0,0,0,0.4);
+        }
+        .modal-content {
+            background-color: #fefefe;
+            margin: 15% auto;
+            padding: 20px;
+            border: 1px solid #888;
+            width: 80%;
+            max-width: 500px;
+            border-radius: 8px;
+        }
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            margin-top: 20px;
+        }
+        .modal-actions button {
+            margin-left: 10px;
         }
     </style>
 </head>
@@ -184,7 +216,22 @@
         </div>
     </div>
 
+    <!-- Modal Konfirmasi Hapus -->
+    <div id="deleteModal" class="modal">
+        <div class="modal-content">
+            <h3>Konfirmasi Hapus</h3>
+            <p>Apakah Anda yakin ingin menghapus firmware <span id="delete-firmware-name"></span>?</p>
+            <div class="modal-actions">
+                <button class="btn" onclick="closeDeleteModal()">Batal</button>
+                <button class="btn btn-red" onclick="confirmDelete()">Hapus</button>
+            </div>
+        </div>
+    </div>
+
     <script>
+        // Variabel global untuk data hapus
+        let currentDeleteFilename = null;
+
         // Fungsi untuk format ukuran file
         function formatBytes(bytes, decimals = 2) {
             if (bytes === 0) return '0 Bytes';
@@ -276,8 +323,9 @@
                             <td>${formatBytes(firmware.size)}</td>
                             <td>${formatDate(firmware.date)}</td>
                             <td>${firmware.md5}</td>
-                            <td>
+                            <td class="action-buttons">
                                 <a href="/firmware/${firmware.name}" class="btn" download>Download</a>
+                                <button class="btn btn-red" onclick="showDeleteModal('${firmware.name}')">Hapus</button>
                             </td>
                         </tr>
                     `;
@@ -287,6 +335,50 @@
             } catch (error) {
                 document.getElementById('firmware-list').innerHTML = '<tr><td colspan="6">Error mendapatkan daftar firmware</td></tr>';
                 console.error('Error getting firmware list:', error);
+            }
+        }
+
+        // Menampilkan modal konfirmasi hapus
+        function showDeleteModal(filename) {
+            currentDeleteFilename = filename;
+            document.getElementById('delete-firmware-name').textContent = filename;
+            document.getElementById('deleteModal').style.display = 'block';
+        }
+
+        // Menutup modal konfirmasi hapus
+        function closeDeleteModal() {
+            document.getElementById('deleteModal').style.display = 'none';
+            currentDeleteFilename = null;
+        }
+
+        // Konfirmasi penghapusan firmware
+        async function confirmDelete() {
+            if (!currentDeleteFilename) {
+                closeDeleteModal();
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/firmware/delete/${currentDeleteFilename}`, {
+                    method: 'DELETE'
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    alert(`Firmware ${currentDeleteFilename} berhasil dihapus`);
+                    // Refresh data
+                    getLatestFirmware();
+                    getFirmwareList();
+                } else {
+                    alert(`Gagal menghapus firmware: ${data.error}`);
+                }
+                
+                closeDeleteModal();
+            } catch (error) {
+                alert('Error menghapus firmware');
+                console.error('Error deleting firmware:', error);
+                closeDeleteModal();
             }
         }
 
@@ -346,6 +438,14 @@
                 console.error('Error uploading firmware:', error);
             }
         });
+
+        // Menutup modal dengan klik di luar
+        window.onclick = function(event) {
+            const modal = document.getElementById('deleteModal');
+            if (event.target == modal) {
+                closeDeleteModal();
+            }
+        }
 
         // Inisialisasi
         checkServerStatus();
