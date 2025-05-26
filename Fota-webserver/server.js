@@ -1,5 +1,6 @@
-// ====== ENHANCED FOTA SERVER WITH HTTP AND TCP SUPPORT ======
+// ====== ENHANCED TCP SERVER WITH LENGTH PREFIXING ======
 const express = require('express');
+const mqtt = require('mqtt');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -8,18 +9,20 @@ const zlib = require('zlib');
 
 // Configuration
 const app = express();
-const HTTP_PORT = 3000;
+const PORT = 3000;
+const MQTT_PORT = 1883;
+const MQTT_BROKER = 'mqtt://localhost';
 const TCP_PORT = 8266;
 
 // FOTA Configuration
 const FIRMWARE_DIR = path.join(__dirname, 'firmware');
-const DEFAULT_CHUNK_SIZE = 512; // Only for TCP
+const DEFAULT_CHUNK_SIZE = 512; // Optimized for mobile data
 const MAX_CHUNK_SIZE = 1024;
 const MIN_CHUNK_SIZE = 128;
 const CONNECTION_TIMEOUT = 30000;
 const CHUNK_RETRY_LIMIT = 3;
 
-// Session Management (Only for TCP)
+// Session Management
 const activeSessions = new Map();
 const deviceConnections = new Map();
 
@@ -28,8 +31,6 @@ const performanceMetrics = {
   totalConnections: 0,
   successfulDownloads: 0,
   failedDownloads: 0,
-  httpDownloads: 0,
-  tcpDownloads: 0,
   averageSpeed: 0,
   chunksServed: 0,
   retryCount: 0
@@ -40,183 +41,7 @@ if (!fs.existsSync(FIRMWARE_DIR)) {
   fs.mkdirSync(FIRMWARE_DIR, { recursive: true });
 }
 
-// ======= HTTP FOTA ENDPOINTS =======
-
-// Middleware
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-// HTTP: Check firmware version
-app.get('/api/firmware/check', async (req, res) => {
-  try {
-    const deviceId = req.query.device || req.headers['x-device-id'] || 'unknown';
-    const currentVersion = req.query.version || req.headers['x-current-version'] || '0.0.0';
-    
-    console.log(`🌐 HTTP Firmware check from device: ${deviceId}, current version: ${currentVersion}`);
-    
-    const firmwareInfo = await getLatestFirmwareInfo();
-    
-    if (!firmwareInfo) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'No firmware available',
-        code: 'NO_FIRMWARE'
-      });
-    }
-    
-    const hasUpdate = isNewerVersion(firmwareInfo.version, currentVersion);
-    
-    const response = {
-      status: 'success',
-      updateAvailable: hasUpdate,
-      version: firmwareInfo.version,
-      currentVersion: currentVersion,
-      name: firmwareInfo.name,
-      size: firmwareInfo.size,
-      md5: firmwareInfo.md5,
-      sha256: firmwareInfo.sha256,
-      downloadUrl: `/api/firmware/download`,
-      releaseNotes: `Firmware version ${firmwareInfo.version}`
-    };
-    
-    console.log(`✅ HTTP Firmware check response: update=${hasUpdate}, latest=${firmwareInfo.version}`);
-    res.json(response);
-    
-  } catch (error) {
-    console.error('HTTP Firmware check error:', error);
-    res.status(500).json({
-      status: 'error',
-      message: 'Internal server error',
-      code: 'SERVER_ERROR'
-    });
-  }
-});
-
-// HTTP: Download firmware (direct download, no chunking)
-app.get('/api/firmware/download', async (req, res) => {
-  try {
-    const deviceId = req.query.device || req.headers['x-device-id'] || 'unknown';
-    const acceptCompression = req.headers['accept-encoding']?.includes('gzip') || req.query.compress === 'true';
-    
-    console.log(`📥 HTTP Firmware download request from device: ${deviceId}, compression: ${acceptCompression}`);
-    
-    const firmwareInfo = await getLatestFirmwareInfo();
-    
-    if (!firmwareInfo) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'No firmware available',
-        code: 'NO_FIRMWARE'
-      });
-    }
-    
-    const startTime = Date.now();
-    
-    // Read firmware file
-    const firmwareBuffer = fs.readFileSync(firmwareInfo.path);
-    
-    // Set headers
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${firmwareInfo.name}"`);
-    res.setHeader('X-Firmware-Version', firmwareInfo.version);
-    res.setHeader('X-Firmware-Size', firmwareInfo.size.toString());
-    res.setHeader('X-Firmware-MD5', firmwareInfo.md5);
-    res.setHeader('X-Firmware-SHA256', firmwareInfo.sha256);
-    res.setHeader('X-Device-ID', deviceId);
-    
-    // Optional compression
-    if (acceptCompression && firmwareBuffer.length > 1024) {
-      const compressedBuffer = zlib.gzipSync(firmwareBuffer);
-      console.log(`🗜️ HTTP Compressed ${firmwareBuffer.length} → ${compressedBuffer.length} bytes (${((1 - compressedBuffer.length/firmwareBuffer.length) * 100).toFixed(1)}% reduction)`);
-      
-      res.setHeader('Content-Encoding', 'gzip');
-      res.setHeader('Content-Length', compressedBuffer.length.toString());
-      res.setHeader('X-Original-Size', firmwareBuffer.length.toString());
-      res.send(compressedBuffer);
-    } else {
-      res.setHeader('Content-Length', firmwareBuffer.length.toString());
-      res.send(firmwareBuffer);
-    }
-    
-    const downloadTime = Date.now() - startTime;
-    const speedKbps = (firmwareInfo.size / 1024) / (downloadTime / 1000);
-    
-    performanceMetrics.httpDownloads++;
-    performanceMetrics.successfulDownloads++;
-    
-    console.log(`✅ HTTP Firmware download completed for ${deviceId}: ${firmwareInfo.size} bytes in ${downloadTime}ms (${speedKbps.toFixed(2)} KB/s)`);
-    
-  } catch (error) {
-    console.error('HTTP Firmware download error:', error);
-    performanceMetrics.failedDownloads++;
-    
-    if (!res.headersSent) {
-      res.status(500).json({
-        status: 'error',
-        message: 'Download failed',
-        code: 'DOWNLOAD_ERROR'
-      });
-    }
-  }
-});
-
-// HTTP: Verify firmware
-app.post('/api/firmware/verify', async (req, res) => {
-  try {
-    const { hash, hashType = 'md5', deviceId = 'unknown' } = req.body;
-    
-    console.log(`🔍 HTTP Firmware verification from device: ${deviceId}, hash type: ${hashType}`);
-    
-    if (!hash) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'Hash is required',
-        code: 'MISSING_HASH'
-      });
-    }
-    
-    const firmwareInfo = await getLatestFirmwareInfo();
-    
-    if (!firmwareInfo) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'No firmware available for verification',
-        code: 'NO_FIRMWARE'
-      });
-    }
-    
-    const expectedHash = hashType === 'sha256' ? firmwareInfo.sha256 : firmwareInfo.md5;
-    const isValid = hash.toLowerCase() === expectedHash.toLowerCase();
-    
-    const response = {
-      status: 'success',
-      verified: isValid,
-      expectedHash: expectedHash,
-      receivedHash: hash,
-      hashType: hashType,
-      firmwareVersion: firmwareInfo.version,
-      message: isValid ? 'Firmware integrity verified' : 'Hash mismatch detected'
-    };
-    
-    if (isValid) {
-      console.log(`✅ HTTP Firmware verification successful for ${deviceId} (${hashType.toUpperCase()})`);
-    } else {
-      console.log(`❌ HTTP Firmware verification failed for ${deviceId} (${hashType.toUpperCase()})`);
-    }
-    
-    res.json(response);
-    
-  } catch (error) {
-    console.error('HTTP Firmware verification error:', error);
-    res.status(500).json({
-      status: 'error',
-      message: 'Verification failed',
-      code: 'VERIFY_ERROR'
-    });
-  }
-});
-
-// ======= CRC16 CALCULATION FOR TCP LENGTH PREFIXING =======
+// ======= CRC16 CALCULATION FOR LENGTH PREFIXING =======
 function calculateCRC16(data) {
   let crc = 0xFFFF;
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
@@ -234,7 +59,7 @@ function calculateCRC16(data) {
   return crc & 0xFFFF;
 }
 
-// ======= TCP SERVER IMPLEMENTATION (CHUNKED DOWNLOAD) =======
+// ======= ENHANCED TCP SERVER IMPLEMENTATION =======
 const tcpServer = net.createServer((socket) => {
   const clientId = `${socket.remoteAddress}:${socket.remotePort}`;
   console.log(`🔌 ESP32 connected via TCP: ${clientId}`);
@@ -315,7 +140,7 @@ function cleanupConnection(clientId) {
   deviceConnections.delete(clientId);
 }
 
-// Enhanced request handler for TCP
+// Enhanced request handler
 async function handleTcpRequest(socket, message, clientId) {
   const startTime = Date.now();
   
@@ -333,19 +158,19 @@ async function handleTcpRequest(socket, message, clientId) {
     
     switch (action) {
       case 'check':
-        await handleTcpFirmwareCheck(socket, deviceId, request, clientId);
+        await handleFirmwareCheck(socket, deviceId, request, clientId);
         break;
         
       case 'download':
-        await handleTcpFirmwareDownload(socket, deviceId, request, clientId);
+        await handleFirmwareDownload(socket, deviceId, request, clientId);
         break;
         
       case 'verify':
-        await handleTcpFirmwareVerify(socket, deviceId, request, clientId);
+        await handleFirmwareVerify(socket, deviceId, request, clientId);
         break;
         
       case 'resume':
-        await handleTcpDownloadResume(socket, deviceId, request, clientId);
+        await handleDownloadResume(socket, deviceId, request, clientId);
         break;
         
       default:
@@ -353,7 +178,7 @@ async function handleTcpRequest(socket, message, clientId) {
     }
     
     const processingTime = Date.now() - startTime;
-    console.log(`⚡ TCP Request processed in ${processingTime}ms`);
+    console.log(`⚡ Request processed in ${processingTime}ms`);
     
   } catch (error) {
     console.error(`🚨 Error handling TCP request from ${clientId}:`, error.message);
@@ -365,8 +190,8 @@ async function handleTcpRequest(socket, message, clientId) {
   }
 }
 
-// TCP firmware check with session management
-async function handleTcpFirmwareCheck(socket, deviceId, request, clientId) {
+// Enhanced firmware check with session management
+async function handleFirmwareCheck(socket, deviceId, request, clientId) {
   try {
     const firmwareInfo = await getLatestFirmwareInfo();
     
@@ -394,7 +219,7 @@ async function handleTcpFirmwareCheck(socket, deviceId, request, clientId) {
       sessionId = existingSession.sessionId;
       session = existingSession.session;
       session.interrupted = false;
-      console.log(`🔄 Resuming existing TCP session for ${deviceId}: ${sessionId}`);
+      console.log(`🔄 Resuming existing session for ${deviceId}: ${sessionId}`);
     } else {
       // Create new session
       sessionId = generateSessionId();
@@ -415,7 +240,7 @@ async function handleTcpFirmwareCheck(socket, deviceId, request, clientId) {
       };
       
       activeSessions.set(sessionId, session);
-      console.log(`✨ Created new TCP session for ${deviceId}: ${sessionId}`);
+      console.log(`✨ Created new session for ${deviceId}: ${sessionId}`);
     }
     
     // Update connection session
@@ -439,11 +264,11 @@ async function handleTcpFirmwareCheck(socket, deviceId, request, clientId) {
       compressionSupported: true
     };
     
-    console.log(`✅ TCP Firmware check for ${deviceId}: v${firmwareInfo.version}, ${firmwareInfo.size} bytes, resume=${session.lastOffset}`);
+    console.log(`✅ Firmware check for ${deviceId}: v${firmwareInfo.version}, ${firmwareInfo.size} bytes, resume=${session.lastOffset}`);
     await sendTcpResponse(socket, response);
     
   } catch (error) {
-    console.error('Error in TCP firmware check:', error);
+    console.error('Error in firmware check:', error);
     await sendTcpResponse(socket, {
       status: 'error',
       message: 'Internal server error',
@@ -452,8 +277,8 @@ async function handleTcpFirmwareCheck(socket, deviceId, request, clientId) {
   }
 }
 
-// TCP firmware download with length prefixing
-async function handleTcpFirmwareDownload(socket, deviceId, request, clientId) {
+// Enhanced firmware download with length prefixing
+async function handleFirmwareDownload(socket, deviceId, request, clientId) {
   try {
     const offset = request.offset || 0;
     let chunkSize = request.size || DEFAULT_CHUNK_SIZE;
@@ -506,10 +331,10 @@ async function handleTcpFirmwareDownload(socket, deviceId, request, clientId) {
         if (compressedChunk.length < firmwareData.chunk.length * 0.85) {
           finalChunk = compressedChunk;
           compressed = true;
-          console.log(`🗜️ TCP Compressed ${firmwareData.chunk.length} → ${compressedChunk.length} bytes`);
+          console.log(`🗜️ Compressed ${firmwareData.chunk.length} → ${compressedChunk.length} bytes`);
         }
       } catch (compError) {
-        console.warn('TCP Compression failed, using uncompressed data');
+        console.warn('Compression failed, using uncompressed data');
       }
     }
     
@@ -544,15 +369,14 @@ async function handleTcpFirmwareDownload(socket, deviceId, request, clientId) {
     }
     
     performanceMetrics.chunksServed++;
-    performanceMetrics.tcpDownloads++;
     
-    console.log(`📦 TCP Chunk: offset=${offset}, size=${firmwareData.actualSize}→${finalChunk.length}, crc=${dataCrc16}, comp=${compressed}, prog=${minimalHeader.p}%`);
+    console.log(`📦 Chunk: offset=${offset}, size=${firmwareData.actualSize}→${finalChunk.length}, crc=${dataCrc16}, comp=${compressed}, prog=${minimalHeader.p}%`);
     
     // Send response with LENGTH PREFIXED binary data
     await sendTcpResponseWithLengthPrefix(socket, minimalHeader, finalChunk);
     
   } catch (error) {
-    console.error('Error in TCP firmware download:', error);
+    console.error('Error in firmware download:', error);
     performanceMetrics.retryCount++;
     await sendTcpResponse(socket, {
       status: 'error',
@@ -563,8 +387,8 @@ async function handleTcpFirmwareDownload(socket, deviceId, request, clientId) {
   }
 }
 
-// TCP resume handler
-async function handleTcpDownloadResume(socket, deviceId, request, clientId) {
+// Enhanced resume handler
+async function handleDownloadResume(socket, deviceId, request, clientId) {
   try {
     const sessionId = request.sessionId;
     
@@ -597,11 +421,11 @@ async function handleTcpDownloadResume(socket, deviceId, request, clientId) {
       chunkSize: DEFAULT_CHUNK_SIZE
     };
     
-    console.log(`🔄 TCP Resume for ${deviceId}: offset=${session.lastOffset}, chunks=${session.downloadedChunks}/${session.totalChunks}`);
+    console.log(`🔄 Resume for ${deviceId}: offset=${session.lastOffset}, chunks=${session.downloadedChunks}/${session.totalChunks}`);
     await sendTcpResponse(socket, response);
     
   } catch (error) {
-    console.error('Error in TCP download resume:', error);
+    console.error('Error in download resume:', error);
     await sendTcpResponse(socket, {
       status: 'error',
       message: 'Resume failed',
@@ -610,8 +434,8 @@ async function handleTcpDownloadResume(socket, deviceId, request, clientId) {
   }
 }
 
-// TCP verification with SHA256 support
-async function handleTcpFirmwareVerify(socket, deviceId, request, clientId) {
+// Enhanced verification with SHA256 support
+async function handleFirmwareVerify(socket, deviceId, request, clientId) {
   try {
     const sessionId = request.sessionId;
     const clientHash = request.hash;
@@ -643,16 +467,16 @@ async function handleTcpFirmwareVerify(socket, deviceId, request, clientId) {
     if (isValid) {
       session.completed = true;
       performanceMetrics.successfulDownloads++;
-      console.log(`✅ TCP Firmware verification successful for ${deviceId} (${hashType.toUpperCase()})`);
+      console.log(`✅ Firmware verification successful for ${deviceId} (${hashType.toUpperCase()})`);
     } else {
       performanceMetrics.failedDownloads++;
-      console.log(`❌ TCP Firmware verification failed for ${deviceId} (${hashType.toUpperCase()})`);
+      console.log(`❌ Firmware verification failed for ${deviceId} (${hashType.toUpperCase()})`);
     }
     
     await sendTcpResponse(socket, response);
     
   } catch (error) {
-    console.error('Error in TCP firmware verification:', error);
+    console.error('Error in firmware verification:', error);
     await sendTcpResponse(socket, {
       status: 'error',
       message: 'Verification failed',
@@ -660,8 +484,6 @@ async function handleTcpFirmwareVerify(socket, deviceId, request, clientId) {
     });
   }
 }
-
-// ======= SHARED HELPER FUNCTIONS =======
 
 // Enhanced firmware info with dual hash calculation
 async function getLatestFirmwareInfo() {
@@ -742,23 +564,7 @@ async function getFirmwareChunk(filePath, offset, requestedSize) {
   }
 }
 
-// Version comparison helper
-function isNewerVersion(latest, current) {
-  const latestParts = latest.split('.').map(Number);
-  const currentParts = current.split('.').map(Number);
-  
-  for (let i = 0; i < Math.max(latestParts.length, currentParts.length); i++) {
-    const latestPart = latestParts[i] || 0;
-    const currentPart = currentParts[i] || 0;
-    
-    if (latestPart > currentPart) return true;
-    if (latestPart < currentPart) return false;
-  }
-  
-  return false;
-}
-
-// Standard JSON response for TCP
+// Standard JSON response
 async function sendTcpResponse(socket, responseObject) {
   return new Promise((resolve, reject) => {
     try {
@@ -778,7 +584,7 @@ async function sendTcpResponse(socket, responseObject) {
   });
 }
 
-// Length-prefixed binary response for TCP
+// NEW: Length-prefixed binary response
 async function sendTcpResponseWithLengthPrefix(socket, header, binaryData) {
   return new Promise((resolve, reject) => {
     try {
@@ -809,7 +615,7 @@ function generateSessionId() {
   return crypto.randomBytes(8).toString('hex'); // Shorter session IDs
 }
 
-// Enhanced session cleanup (TCP only)
+// Enhanced session cleanup
 setInterval(() => {
   const now = Date.now();
   const SESSION_TIMEOUT = 45 * 60 * 1000; // 45 minutes
@@ -822,13 +628,13 @@ setInterval(() => {
       age > SESSION_TIMEOUT;
     
     if (shouldCleanup) {
-      console.log(`🧹 Cleaning up TCP session: ${sessionId} (${session.completed ? 'completed' : session.interrupted ? 'interrupted' : 'expired'})`);
+      console.log(`🧹 Cleaning up session: ${sessionId} (${session.completed ? 'completed' : session.interrupted ? 'interrupted' : 'expired'})`);
       activeSessions.delete(sessionId);
     }
   }
 }, 5 * 60 * 1000);
 
-// Enhanced metrics endpoint
+// Enhanced metrics
 app.get('/api/metrics', (req, res) => {
   const activeConnectionCount = deviceConnections.size;
   const activeSessionCount = activeSessions.size;
@@ -849,90 +655,17 @@ app.get('/api/metrics', (req, res) => {
     sessions: sessionsInfo,
     uptime: process.uptime(),
     memoryUsage: process.memoryUsage(),
-    timestamp: new Date().toISOString(),
-    protocols: {
-      http: {
-        downloads: performanceMetrics.httpDownloads,
-        features: ['Direct Download', 'Compression', 'Resume Support']
-      },
-      tcp: {
-        downloads: performanceMetrics.tcpDownloads,
-        features: ['Chunked Download', 'Length Prefixing', 'CRC16', 'Session Management']
-      }
-    }
+    timestamp: new Date().toISOString()
   };
   
   res.json(metrics);
 });
 
-// API endpoint to list available firmware
-app.get('/api/firmware/list', async (req, res) => {
-  try {
-    const files = fs.readdirSync(FIRMWARE_DIR);
-    const firmwareFiles = files
-      .filter(file => file.endsWith('.bin'))
-      .map(file => {
-        const filePath = path.join(FIRMWARE_DIR, file);
-        const stats = fs.statSync(filePath);
-        const versionMatch = file.match(/_v(\d+\.\d+\.\d+)\.bin$/);
-        const version = versionMatch ? versionMatch[1] : '1.0.0';
-        
-        return {
-          name: file,
-          version: version,
-          size: stats.size,
-          modified: stats.mtime,
-          sizeHuman: formatBytes(stats.size)
-        };
-      })
-      .sort((a, b) => b.modified - a.modified);
-    
-    res.json({
-      status: 'success',
-      firmware: firmwareFiles,
-      total: firmwareFiles.length
-    });
-    
-  } catch (error) {
-    console.error('Error listing firmware:', error);
-    res.status(500).json({
-      status: 'error',
-      message: 'Failed to list firmware files',
-      code: 'LIST_ERROR'
-    });
-  }
-});
-
-// Helper function to format bytes
-function formatBytes(bytes, decimals = 2) {
-  if (bytes === 0) return '0 Bytes';
-  
-  const k = 1024;
-  const dm = decimals < 0 ? 0 : decimals;
-  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-  
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
-}
-
 // Start servers
-tcpServer.listen(TCP_PORT, '0.0.0.0', () => {
-  console.log(`🚀 TCP FOTA server (chunked) running on port ${TCP_PORT}`);
+tcpServer.listen(TCP_PORT, () => {
+  console.log(`🚀 Enhanced TCP FOTA server with Length Prefixing running on port ${TCP_PORT}`);
   console.log(`📊 Chunk size range: ${MIN_CHUNK_SIZE}-${MAX_CHUNK_SIZE} bytes`);
-  console.log(`🔧 TCP Features: Length prefixing, CRC16, Resume, Compression, SHA256`);
-});
-
-app.listen(HTTP_PORT, '0.0.0.0', () => {
-  console.log(`🌐 HTTP FOTA server (direct) running on port ${HTTP_PORT}`);
-  console.log(`🔧 HTTP Features: Direct download, Compression, Verification`);
-  console.log(`📁 Firmware directory: ${FIRMWARE_DIR}`);
-  console.log(`\n📋 Available endpoints:`);
-  console.log(`   GET  /api/firmware/check     - Check for firmware updates`);
-  console.log(`   GET  /api/firmware/download  - Download firmware directly`);
-  console.log(`   POST /api/firmware/verify    - Verify firmware integrity`);
-  console.log(`   GET  /api/firmware/list      - List available firmware`);
-  console.log(`   GET  /api/metrics            - Server metrics and stats`);
+  console.log(`🔧 Features: Length prefixing, CRC16, Resume, Compression, SHA256`);
 });
 
 tcpServer.on('error', (err) => {
@@ -940,17 +673,167 @@ tcpServer.on('error', (err) => {
 });
 
 process.on('SIGINT', () => {
-  console.log('\n🛑 Shutting down servers...');
+  console.log('\n🛑 Shutting down server...');
   tcpServer.close(() => {
     console.log('✅ TCP server closed');
     process.exit(0);
   });
 });
 
-console.log(`\n🎯 FOTA Server Ready!`);
-console.log(`📡 TCP (chunked):  esp32 → tcp://server:${TCP_PORT}`);
-console.log(`🌐 HTTP (direct):  esp32 → http://server:${HTTP_PORT}/api/firmware/*`);
-console.log(`📊 Metrics:        http://server:${HTTP_PORT}/api/metrics`);
-console.log(`\n💡 Usage Examples:`);
-console.log(`   curl http://localhost:${HTTP_PORT}/api/firmware/check?device=esp32_001&version=1.0.0`);
-console.log(`   curl -o firmware.bin http://localhost:${HTTP_PORT}/api/firmware/download?device=esp32_001`);
+// HTTP server for metrics
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.post('/api/firmware/upload', express.raw({ type: 'application/octet-stream', limit: '8mb' }), (req, res) => {
+  try {
+    // Dapatkan versi dari query parameter
+    const version = req.query.version || '1.0.0';
+    const fileName = `esp32_firmware_v${version}.bin`;
+    const filePath = path.join(FIRMWARE_DIR, fileName);
+    
+    // Tulis file firmware
+    fs.writeFileSync(filePath, req.body);
+    
+    // Hitung MD5 hash
+    const md5Hash = crypto.createHash('md5').update(req.body).digest('hex');
+    
+    res.json({
+      success: true,
+      fileName: fileName,
+      size: req.body.length,
+      md5: md5Hash
+    });
+  } catch (error) {
+    console.error('Error uploading firmware:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// API untuk daftar firmware
+app.get('/api/firmware/list', (req, res) => {
+  try {
+    const files = fs.readdirSync(FIRMWARE_DIR)
+      .filter(file => file.endsWith('.bin'))
+      .map(file => {
+        const filePath = path.join(FIRMWARE_DIR, file);
+        const stats = fs.statSync(filePath);
+        const fileBuffer = fs.readFileSync(filePath);
+        const md5Hash = crypto.createHash('md5').update(fileBuffer).digest('hex');
+        
+        // Ekstrak versi dari nama file
+        const versionMatch = file.match(/_v(\d+\.\d+\.\d+)\.bin$/);
+        const version = versionMatch ? versionMatch[1] : 'unknown';
+        
+        return {
+          name: file,
+          version: version,
+          size: stats.size,
+          date: stats.mtime,
+          md5: md5Hash
+        };
+      })
+      .sort((a, b) => b.date - a.date);
+    
+    res.json(files);
+  } catch (error) {
+    console.error('Error listing firmware:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Api Status Checker
+app.get('/api/status', (req, res) => {
+  res.json({ 
+    status: 'running', 
+    timestamp: new Date().toISOString(),
+    tcp_port: TCP_PORT,
+    mqtt_port: MQTT_PORT
+  });
+});
+
+// Informasi tentang firmware terbaru
+app.get('/api/firmware/latest', (req, res) => {
+  try {
+    // Cari file firmware terbaru di folder
+    const files = fs.readdirSync(FIRMWARE_DIR);
+    if (files.length === 0) {
+      return res.status(404).json({ error: 'Tidak ada firmware tersedia' });
+    }
+
+    // Urutkan file berdasarkan waktu modifikasi (terbaru ke lama)
+    const sortedFiles = files
+      .filter(file => file.endsWith('.bin'))
+      .map(file => {
+        const filePath = path.join(FIRMWARE_DIR, file);
+        const stats = fs.statSync(filePath);
+        return {
+          name: file,
+          path: filePath,
+          size: stats.size,
+          mtime: stats.mtime
+        };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+
+    if (sortedFiles.length === 0) {
+      return res.status(404).json({ error: 'Tidak ada firmware tersedia' });
+    }
+
+    // Ambil file terbaru
+    const latestFirmware = sortedFiles[0];
+    
+    // Ekstrak versi dari nama file
+    const versionMatch = latestFirmware.name.match(/_v(\d+\.\d+\.\d+)\.bin$/);
+    const version = versionMatch ? versionMatch[1] : '1.0.0';
+    
+    // Hitung MD5 hash
+    const fileBuffer = fs.readFileSync(latestFirmware.path);
+    const md5Hash = crypto.createHash('md5').update(fileBuffer).digest('hex');
+    
+    const firmwareInfo = {
+      version: version,
+      name: latestFirmware.name,
+      file: `firmware/${latestFirmware.name}`,
+      size: latestFirmware.size,
+      md5: md5Hash
+    };
+    
+    res.json(firmwareInfo);
+  } catch (error) {
+    console.error('Error accessing firmware:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete Firmware from the list
+app.delete('/api/firmware/delete/:filename', (req, res) => {
+  try {
+    const filename = req.params.filename;
+    const filePath = path.join(FIRMWARE_DIR, filename);
+    
+    // Verifikasi bahwa file ada
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File tidak ditemukan' });
+    }
+    
+    // Verifikasi bahwa file adalah firmware .bin
+    if (!filename.endsWith('.bin')) {
+      return res.status(400).json({ error: 'Hanya file firmware .bin yang dapat dihapus' });
+    }
+    
+    // Hapus file
+    fs.unlinkSync(filePath);
+    
+    res.json({
+      success: true,
+      message: `Firmware ${filename} berhasil dihapus`
+    });
+  } catch (error) {
+    console.error('Error deleting firmware:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`📊 HTTP metrics server running on port ${PORT}`);
+});
