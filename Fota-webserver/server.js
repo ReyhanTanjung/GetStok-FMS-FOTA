@@ -1015,7 +1015,142 @@ app.get('/api/firmware/download/:filename', (req, res) => {
   res.redirect(`/api/fota/download/${req.params.filename}`);
 });
 
+// Add this endpoint to server.js for optimized SIM800L downloads
+
+// Optimized HTTP FOTA endpoint for SIM800L
+app.get('/api/fota/sim800l/download/:filename', async (req, res) => {
+  try {
+    const filename = req.params.filename;
+    const filePath = path.join(FIRMWARE_DIR, filename);
+    const deviceId = req.query.device || req.headers['user-agent'] || 'unknown';
+    const range = req.headers.range;
+    
+    console.log(`📥 SIM800L FOTA download request from ${deviceId}: ${filename}`);
+    
+    // Verify file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Firmware file not found',
+        code: 'FILE_NOT_FOUND'
+      });
+    }
+    
+    // Get file stats
+    const stats = fs.statSync(filePath);
+    const fileSize = stats.size;
+    
+    // Support for partial content (range requests)
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunksize = (end - start) + 1;
+      
+      console.log(`📦 Range request: ${start}-${end}/${fileSize}`);
+      
+      const fileStream = fs.createReadStream(filePath, { start, end });
+      
+      res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunksize,
+        'Content-Type': 'application/octet-stream',
+        'Cache-Control': 'no-cache'
+      });
+      
+      fileStream.pipe(res);
+    } else {
+      // Full file download
+      const fileBuffer = fs.readFileSync(filePath);
+      const md5Hash = crypto.createHash('md5').update(fileBuffer).digest('hex');
+      const sha256Hash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+      
+      // Set simple headers for SIM800L compatibility
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Length', fileSize);
+      res.setHeader('X-MD5', md5Hash);
+      res.setHeader('X-SHA256', sha256Hash);
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'close'); // Important for SIM800L
+      
+      console.log(`📦 Sending full firmware: ${filename} (${fileSize} bytes)`);
+      
+      // Track download
+      performanceMetrics.httpDownloads++;
+      const startTime = Date.now();
+      
+      // Send the file without chunked encoding
+      res.end(fileBuffer);
+      
+      const downloadTime = Date.now() - startTime;
+      console.log(`✅ SIM800L download completed: ${filename} in ${downloadTime}ms`);
+      performanceMetrics.successfulDownloads++;
+    }
+    
+  } catch (error) {
+    console.error('Error in SIM800L FOTA download:', error);
+    performanceMetrics.failedDownloads++;
+    res.status(500).json({
+      status: 'error',
+      message: 'Download failed',
+      code: 'DOWNLOAD_ERROR'
+    });
+  }
+});
+
+// Modified check endpoint for SIM800L
+app.get('/api/fota/sim800l/check', async (req, res) => {
+  try {
+    const deviceId = req.query.device || 'unknown';
+    const currentVersion = req.query.version || '0.0.0';
+    
+    console.log(`📱 SIM800L FOTA check from device: ${deviceId}, version: ${currentVersion}`);
+    
+    const firmwareInfo = await getLatestFirmwareInfo();
+    
+    if (!firmwareInfo) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'No firmware available'
+      });
+    }
+    
+    const updateAvailable = firmwareInfo.version !== currentVersion;
+    
+    // Simplified response for SIM800L
+    const response = {
+      status: 'success',
+      updateAvailable: updateAvailable,
+      version: firmwareInfo.version,
+      size: firmwareInfo.size,
+      md5: firmwareInfo.md5,
+      sha256: firmwareInfo.sha256,
+      fullDownloadUrl: `http://${req.hostname}:${PORT}/api/fota/sim800l/download/${firmwareInfo.name}`
+    };
+    
+    console.log(`✅ SIM800L check: ${updateAvailable ? 'Update available' : 'Up to date'}`);
+    
+    // Keep response minimal
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Connection', 'close');
+    res.json(response);
+    
+  } catch (error) {
+    console.error('Error in SIM800L FOTA check:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Server error'
+    });
+  }
+});
+
+
+
 app.listen(PORT, () => {
+  console.log(`📱 SIM800L FOTA endpoints:`);
+  console.log(`   • Check: GET /api/fota/sim800l/check`);
+  console.log(`   • Download: GET /api/fota/sim800l/download/<filename>`);
   console.log(`📊 HTTP server running on port ${PORT}`);
   console.log(`🌐 HTTP FOTA endpoints available:`);
   console.log(`   • Check: GET /api/fota/check?device=<device_id>&version=<current_version>`);
