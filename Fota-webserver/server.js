@@ -1,6 +1,5 @@
-// ====== ENHANCED TCP SERVER WITH LENGTH PREFIXING ======
+// ====== ENHANCED TCP SERVER WITH HTTP FOTA ======
 const express = require('express');
-const mqtt = require('mqtt');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -10,8 +9,6 @@ const zlib = require('zlib');
 // Configuration
 const app = express();
 const PORT = 3000;
-const MQTT_PORT = 1883;
-const MQTT_BROKER = 'mqtt://localhost';
 const TCP_PORT = 8266;
 
 // FOTA Configuration
@@ -33,7 +30,9 @@ const performanceMetrics = {
   failedDownloads: 0,
   averageSpeed: 0,
   chunksServed: 0,
-  retryCount: 0
+  retryCount: 0,
+  httpDownloads: 0,
+  tcpDownloads: 0
 };
 
 // Ensure firmware directory exists
@@ -261,7 +260,9 @@ async function handleFirmwareCheck(socket, deviceId, request, clientId) {
       totalChunks: session.totalChunks,
       resumeOffset: session.lastOffset,
       downloadedChunks: session.downloadedChunks,
-      compressionSupported: true
+      compressionSupported: true,
+      // Add HTTP download URL
+      httpDownloadUrl: `http://localhost:${PORT}/api/firmware/download/${firmwareInfo.name}`
     };
     
     console.log(`✅ Firmware check for ${deviceId}: v${firmwareInfo.version}, ${firmwareInfo.size} bytes, resume=${session.lastOffset}`);
@@ -369,6 +370,7 @@ async function handleFirmwareDownload(socket, deviceId, request, clientId) {
     }
     
     performanceMetrics.chunksServed++;
+    performanceMetrics.tcpDownloads++;
     
     console.log(`📦 Chunk: offset=${offset}, size=${firmwareData.actualSize}→${finalChunk.length}, crc=${dataCrc16}, comp=${compressed}, prog=${minimalHeader.p}%`);
     
@@ -634,6 +636,184 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// ======= HTTP FOTA ENDPOINTS =======
+
+// HTTP Firmware Check
+app.get('/api/fota/check', async (req, res) => {
+  try {
+    const deviceId = req.query.device || req.headers['user-agent'] || 'unknown';
+    const currentVersion = req.query.version || '0.0.0';
+    
+    console.log(`🌐 HTTP FOTA check from device: ${deviceId}, current version: ${currentVersion}`);
+    
+    const firmwareInfo = await getLatestFirmwareInfo();
+    
+    if (!firmwareInfo) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'No firmware available',
+        code: 'NO_FIRMWARE'
+      });
+    }
+    
+    const updateAvailable = firmwareInfo.version !== currentVersion;
+    
+    const response = {
+      status: 'success',
+      updateAvailable: updateAvailable,
+      version: firmwareInfo.version,
+      name: firmwareInfo.name,
+      size: firmwareInfo.size,
+      md5: firmwareInfo.md5,
+      sha256: firmwareInfo.sha256,
+      downloadUrl: `/api/fota/download/${firmwareInfo.name}`,
+      fullDownloadUrl: `http://localhost:${PORT}/api/fota/download/${firmwareInfo.name}`
+    };
+    
+    console.log(`✅ HTTP FOTA check result: ${updateAvailable ? 'Update available' : 'Up to date'} - v${firmwareInfo.version}`);
+    res.json(response);
+    
+  } catch (error) {
+    console.error('Error in HTTP FOTA check:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Internal server error',
+      code: 'SERVER_ERROR'
+    });
+  }
+});
+
+// HTTP Firmware Download - Full file without chunking
+app.get('/api/fota/download/:filename', async (req, res) => {
+  try {
+    const filename = req.params.filename;
+    const filePath = path.join(FIRMWARE_DIR, filename);
+    const deviceId = req.query.device || req.headers['user-agent'] || 'unknown';
+    
+    console.log(`📥 HTTP FOTA download request from ${deviceId}: ${filename}`);
+    
+    // Verify file exists
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Firmware file not found',
+        code: 'FILE_NOT_FOUND'
+      });
+    }
+    
+    // Get file stats
+    const stats = fs.statSync(filePath);
+    const fileSize = stats.size;
+    
+    // Calculate MD5 for integrity check
+    const fileBuffer = fs.readFileSync(filePath);
+    const md5Hash = crypto.createHash('md5').update(fileBuffer).digest('hex');
+    const sha256Hash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    
+    // Set appropriate headers
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Length', fileSize);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('X-Firmware-MD5', md5Hash);
+    res.setHeader('X-Firmware-SHA256', sha256Hash);
+    res.setHeader('X-Firmware-Size', fileSize);
+    res.setHeader('Cache-Control', 'no-cache');
+    
+    console.log(`📦 Sending full firmware file: ${filename} (${fileSize} bytes, MD5: ${md5Hash})`);
+    
+    // Track download
+    performanceMetrics.httpDownloads++;
+    const startTime = Date.now();
+    
+    // Send the entire file
+    const fileStream = fs.createReadStream(filePath);
+    
+    fileStream.on('end', () => {
+      const downloadTime = Date.now() - startTime;
+      const speedKBps = Math.round((fileSize / 1024) / (downloadTime / 1000));
+      console.log(`✅ HTTP FOTA download completed for ${deviceId}: ${filename} in ${downloadTime}ms (${speedKBps} KB/s)`);
+      performanceMetrics.successfulDownloads++;
+    });
+    
+    fileStream.on('error', (error) => {
+      console.error(`❌ HTTP FOTA download error for ${deviceId}:`, error);
+      performanceMetrics.failedDownloads++;
+    });
+    
+    fileStream.pipe(res);
+    
+  } catch (error) {
+    console.error('Error in HTTP FOTA download:', error);
+    performanceMetrics.failedDownloads++;
+    res.status(500).json({
+      status: 'error',
+      message: 'Download failed',
+      code: 'DOWNLOAD_ERROR'
+    });
+  }
+});
+
+// HTTP Firmware Verify
+app.post('/api/fota/verify', express.json(), async (req, res) => {
+  try {
+    const { filename, hash, hashType = 'md5' } = req.body;
+    const deviceId = req.body.device || req.headers['user-agent'] || 'unknown';
+    
+    console.log(`🔍 HTTP FOTA verify request from ${deviceId}: ${filename} (${hashType.toUpperCase()})`);
+    
+    if (!filename || !hash) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Missing filename or hash',
+        code: 'MISSING_PARAMETERS'
+      });
+    }
+    
+    const filePath = path.join(FIRMWARE_DIR, filename);
+    
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Firmware file not found',
+        code: 'FILE_NOT_FOUND'
+      });
+    }
+    
+    // Calculate expected hash
+    const fileBuffer = fs.readFileSync(filePath);
+    const expectedHash = hashType === 'sha256' ? 
+      crypto.createHash('sha256').update(fileBuffer).digest('hex') :
+      crypto.createHash('md5').update(fileBuffer).digest('hex');
+    
+    const isValid = hash.toLowerCase() === expectedHash.toLowerCase();
+    
+    const response = {
+      status: 'success',
+      verified: isValid,
+      expectedHash: expectedHash,
+      receivedHash: hash,
+      hashType: hashType,
+      message: isValid ? 'Firmware integrity verified' : 'Hash mismatch detected'
+    };
+    
+    if (isValid) {
+      console.log(`✅ HTTP FOTA verification successful for ${deviceId} (${hashType.toUpperCase()})`);
+    } else {
+      console.log(`❌ HTTP FOTA verification failed for ${deviceId} (${hashType.toUpperCase()})`);
+    }
+    
+    res.json(response);
+    
+  } catch (error) {
+    console.error('Error in HTTP FOTA verification:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Verification failed',
+      code: 'VERIFY_ERROR'
+    });
+  }
+});
+
 // Enhanced metrics
 app.get('/api/metrics', (req, res) => {
   const activeConnectionCount = deviceConnections.size;
@@ -680,28 +860,34 @@ process.on('SIGINT', () => {
   });
 });
 
-// HTTP server for metrics
+// HTTP server setup
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Firmware upload endpoint
 app.post('/api/firmware/upload', express.raw({ type: 'application/octet-stream', limit: '8mb' }), (req, res) => {
   try {
-    // Dapatkan versi dari query parameter
+    // Get version from query parameter
     const version = req.query.version || '1.0.0';
     const fileName = `esp32_firmware_v${version}.bin`;
     const filePath = path.join(FIRMWARE_DIR, fileName);
     
-    // Tulis file firmware
+    // Write firmware file
     fs.writeFileSync(filePath, req.body);
     
-    // Hitung MD5 hash
+    // Calculate MD5 and SHA256 hash
     const md5Hash = crypto.createHash('md5').update(req.body).digest('hex');
+    const sha256Hash = crypto.createHash('sha256').update(req.body).digest('hex');
+    
+    console.log(`📤 Firmware uploaded: ${fileName} (${req.body.length} bytes, MD5: ${md5Hash})`);
     
     res.json({
       success: true,
       fileName: fileName,
       size: req.body.length,
-      md5: md5Hash
+      md5: md5Hash,
+      sha256: sha256Hash,
+      version: version
     });
   } catch (error) {
     console.error('Error uploading firmware:', error);
@@ -709,7 +895,7 @@ app.post('/api/firmware/upload', express.raw({ type: 'application/octet-stream',
   }
 });
 
-// API untuk daftar firmware
+// List firmware files
 app.get('/api/firmware/list', (req, res) => {
   try {
     const files = fs.readdirSync(FIRMWARE_DIR)
@@ -719,8 +905,9 @@ app.get('/api/firmware/list', (req, res) => {
         const stats = fs.statSync(filePath);
         const fileBuffer = fs.readFileSync(filePath);
         const md5Hash = crypto.createHash('md5').update(fileBuffer).digest('hex');
+        const sha256Hash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
         
-        // Ekstrak versi dari nama file
+        // Extract version from filename
         const versionMatch = file.match(/_v(\d+\.\d+\.\d+)\.bin$/);
         const version = versionMatch ? versionMatch[1] : 'unknown';
         
@@ -729,7 +916,8 @@ app.get('/api/firmware/list', (req, res) => {
           version: version,
           size: stats.size,
           date: stats.mtime,
-          md5: md5Hash
+          md5: md5Hash,
+          sha256: sha256Hash
         };
       })
       .sort((a, b) => b.date - a.date);
@@ -741,92 +929,79 @@ app.get('/api/firmware/list', (req, res) => {
   }
 });
 
-// Api Status Checker
+// Status check endpoint
 app.get('/api/status', (req, res) => {
   res.json({ 
     status: 'running', 
     timestamp: new Date().toISOString(),
     tcp_port: TCP_PORT,
-    mqtt_port: MQTT_PORT
+    http_port: PORT,
+    features: {
+      tcp_fota: true,
+      http_fota: true,
+      chunked_download: true,
+      full_download: true,
+      compression: true,
+      resume: true,
+      dual_hash: true
+    }
   });
 });
 
-// Informasi tentang firmware terbaru
-app.get('/api/firmware/latest', (req, res) => {
+// Latest firmware info
+app.get('/api/firmware/latest', async (req, res) => {
   try {
-    // Cari file firmware terbaru di folder
-    const files = fs.readdirSync(FIRMWARE_DIR);
-    if (files.length === 0) {
-      return res.status(404).json({ error: 'Tidak ada firmware tersedia' });
+    const firmwareInfo = await getLatestFirmwareInfo();
+    
+    if (!firmwareInfo) {
+      return res.status(404).json({ error: 'No firmware available' });
     }
-
-    // Urutkan file berdasarkan waktu modifikasi (terbaru ke lama)
-    const sortedFiles = files
-      .filter(file => file.endsWith('.bin'))
-      .map(file => {
-        const filePath = path.join(FIRMWARE_DIR, file);
-        const stats = fs.statSync(filePath);
-        return {
-          name: file,
-          path: filePath,
-          size: stats.size,
-          mtime: stats.mtime
-        };
-      })
-      .sort((a, b) => b.mtime - a.mtime);
-
-    if (sortedFiles.length === 0) {
-      return res.status(404).json({ error: 'Tidak ada firmware tersedia' });
-    }
-
-    // Ambil file terbaru
-    const latestFirmware = sortedFiles[0];
     
-    // Ekstrak versi dari nama file
-    const versionMatch = latestFirmware.name.match(/_v(\d+\.\d+\.\d+)\.bin$/);
-    const version = versionMatch ? versionMatch[1] : '1.0.0';
-    
-    // Hitung MD5 hash
-    const fileBuffer = fs.readFileSync(latestFirmware.path);
-    const md5Hash = crypto.createHash('md5').update(fileBuffer).digest('hex');
-    
-    const firmwareInfo = {
-      version: version,
-      name: latestFirmware.name,
-      file: `firmware/${latestFirmware.name}`,
-      size: latestFirmware.size,
-      md5: md5Hash
+    const response = {
+      version: firmwareInfo.version,
+      name: firmwareInfo.name,
+      file: `firmware/${firmwareInfo.name}`,
+      size: firmwareInfo.size,
+      md5: firmwareInfo.md5,
+      sha256: firmwareInfo.sha256,
+      date: firmwareInfo.mtime,
+      // Add direct download URLs
+      tcpDownload: `tcp://localhost:${TCP_PORT}`,
+      httpDownload: `http://localhost:${PORT}/api/fota/download/${firmwareInfo.name}`,
+      checkUrl: `http://localhost:${PORT}/api/fota/check`
     };
     
-    res.json(firmwareInfo);
+    res.json(response);
   } catch (error) {
     console.error('Error accessing firmware:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Delete Firmware from the list
+// Delete firmware
 app.delete('/api/firmware/delete/:filename', (req, res) => {
   try {
     const filename = req.params.filename;
     const filePath = path.join(FIRMWARE_DIR, filename);
     
-    // Verifikasi bahwa file ada
+    // Verify file exists
     if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File tidak ditemukan' });
+      return res.status(404).json({ error: 'File not found' });
     }
     
-    // Verifikasi bahwa file adalah firmware .bin
+    // Verify it's a .bin file
     if (!filename.endsWith('.bin')) {
-      return res.status(400).json({ error: 'Hanya file firmware .bin yang dapat dihapus' });
+      return res.status(400).json({ error: 'Only .bin firmware files can be deleted' });
     }
     
-    // Hapus file
+    // Delete file
     fs.unlinkSync(filePath);
+    
+    console.log(`🗑️ Firmware deleted: ${filename}`);
     
     res.json({
       success: true,
-      message: `Firmware ${filename} berhasil dihapus`
+      message: `Firmware ${filename} successfully deleted`
     });
   } catch (error) {
     console.error('Error deleting firmware:', error);
@@ -834,6 +1009,18 @@ app.delete('/api/firmware/delete/:filename', (req, res) => {
   }
 });
 
+// Legacy firmware download endpoint (for backward compatibility)
+app.get('/api/firmware/download/:filename', (req, res) => {
+  // Redirect to FOTA download endpoint
+  res.redirect(`/api/fota/download/${req.params.filename}`);
+});
+
 app.listen(PORT, () => {
-  console.log(`📊 HTTP metrics server running on port ${PORT}`);
+  console.log(`📊 HTTP server running on port ${PORT}`);
+  console.log(`🌐 HTTP FOTA endpoints available:`);
+  console.log(`   • Check: GET /api/fota/check?device=<device_id>&version=<current_version>`);
+  console.log(`   • Download: GET /api/fota/download/<filename>?device=<device_id>`);
+  console.log(`   • Verify: POST /api/fota/verify`);
+  console.log(`📡 TCP FOTA server running on port ${TCP_PORT}`);
+  console.log(`🔧 Both TCP chunked and HTTP full-file downloads supported`);
 });
