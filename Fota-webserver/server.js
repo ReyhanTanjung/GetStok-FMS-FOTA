@@ -636,6 +636,19 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// Compare Firmware Version
+function isNewerVersion(serverVersion, deviceVersion) {
+  const a = serverVersion.split('.').map(Number);
+  const b = deviceVersion.split('.').map(Number);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] || 0;
+    const y = b[i] || 0;
+    if (x > y) return true;
+    if (x < y) return false;
+  }
+  return false; // equal
+}
+
 // ======= HTTP FOTA ENDPOINTS =======
 
 // HTTP Firmware Check
@@ -656,7 +669,7 @@ app.get('/api/fota/check', async (req, res) => {
       });
     }
     
-    const updateAvailable = firmwareInfo.version !== currentVersion;
+    const updateAvailable = isNewerVersion(firmwareInfo.version, currentVersion);
     
     const response = {
       status: 'success',
@@ -1116,7 +1129,7 @@ app.get('/api/fota/sim800l/check', async (req, res) => {
       });
     }
     
-    const updateAvailable = firmwareInfo.version !== currentVersion;
+    const updateAvailable = isNewerVersion(firmwareInfo.version, currentVersion);
     
     // Simplified response for SIM800L
     const response = {
